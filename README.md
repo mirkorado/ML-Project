@@ -11,5 +11,6 @@ Clone the repository and make sure your directory contains the following strutur
 ## Step 2: run data sanitization 
 
 In a terminal and within a Python virtual environment containing the required packages (pandas) run the 'sanitizing.py' script which reads the above csv files, sanitizes the data and stores the sanitized data into new csv files. 
-This script may take a few minutes to run. 
+
+This script may take a few minutes to run and is memory intensive. It has been shown to work on a pc with 16GB of available RAM and 4GB of swap memory. 
 
