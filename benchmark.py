@@ -167,8 +167,15 @@ def normalize_weights(predictions: pd.Series) -> pd.Series:
     weights = predictions.groupby('date')[['prediction']].transform(lambda x: x / x.sum() if x.sum() != 0 else 0)
     return weights
     
-def sharpe_ratio(returns):
-    return np.round(np.sqrt(250) * returns.mean() / returns.std(), 2)
+def sharpe_ratio(returns_strategy, risk_free_dataset=None, column_return = None, column_risk_free = None):
+    if risk_free_dataset is None:
+        return np.round(np.sqrt(250) * returns_strategy.mean() / returns_strategy.std(), 2)
+    else:
+        total_df = returns_strategy.merge(risk_free_dataset, on = 'date', how = 'left')
+        total_df[column_risk_free] = total_df[column_risk_free].ffill()
+        mean_excess = (total_df[column_return] - total_df[column_risk_free]).mean()
+        excess_std = (total_df[column_return] - total_df[column_risk_free]).std()
+        return np.round(np.sqrt(250) * mean_excess / excess_std, 2)
     
 
 def train_ridge_regr(train_df: pd.DataFrame,
