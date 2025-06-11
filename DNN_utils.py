@@ -146,48 +146,6 @@ def sharpe_ratio_loss(y_pred, y_true, eps=1e-6):
     sharpe = mean / (std + eps)
     return -sharpe
 
-# ---- Evaluation function ----
-def evaluate_sharpe(model, loader, device=None):
-    """Evaluate Sharpe ratio on a given data loader.
-
-    Args:
-        model: PyTorch model
-        loader: DataLoader containing batches of (x_num, x_cat, y)
-        device: Device to run computations on (default: model's device)
-
-    Returns:
-        Sharpe ratio (float)
-    """
-    if device is None:
-        device = next(model.parameters()).device
-
-    model.eval()
-    all_preds = []
-    all_y = []
-
-    with torch.no_grad():
-        for x_num, x_cat, y in loader:
-            # Move data to the same device as model
-            x_num = x_num.to(device)
-            x_cat = x_cat.to(device)
-            y = y.to(device)
-
-            preds = model(x_num, x_cat)
-            all_preds.append(preds)
-            all_y.append(y)
-
-    # Concatenate while keeping tensors 
-    preds = torch.cat(all_preds)
-    y_true = torch.cat(all_y)
-
-    # Compute portfolio returns
-    port_returns = preds * y_true
-    mean_ret = port_returns.mean()
-    std_ret = port_returns.std()
-    sharpe = (mean_ret / (std_ret + 1e-8)).item()  # Convert to Python float
-
-    return sharpe
-
 
 def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rate=0.001):
     
@@ -212,17 +170,18 @@ def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rat
 
     print(f"Starting training with {len(train_loader)} train batches, {len(test_loader)} test batches")
 
-    train_losses, test_losses, train_sharpes, test_sharpes = train_model(
+    train_losses, test_losses, train_sharpes, test_sharpes, strat_returns = train_model(
         model, train_loader, test_loader, optimizer, scheduler, epochs=epochs
     )
 
     print(f"Training completed! Best test Sharpe ratio: {max(test_sharpes):.4f}")
-    return train_losses, test_losses, train_sharpes, test_sharpes
+    return train_losses, test_losses, train_sharpes, test_sharpes, strat_returns
 
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=50):
     """
     Simplified training loop without unnecessary optimizations
+    Returns test predictions from the epoch with highest Sharpe ratio as pandas Series
     """
     train_losses = []
     test_losses = []
@@ -230,6 +189,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
     test_sharpes = []
     
     best_test_sharpe = float('-inf')
+    best_test_predictions = None
     
     for epoch in tqdm(range(epochs), desc="Training"):
         # Training phase
@@ -252,12 +212,18 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
         # Evaluation phase
         model.eval()
         total_test_loss = 0
+        epoch_test_preds = []
         
         with torch.no_grad():
             for x_num, x_cat, y in test_loader:
                 outputs = model(x_num, x_cat)
                 loss = sharpe_ratio_loss(outputs, y)
                 total_test_loss += loss.item()
+                
+                # Store strategy returns for each sample in the batch
+                # Remember we use predictions as weights and multiply with the realised returns
+                strategy_returns = outputs.cpu().numpy() * y.cpu().numpy()  # Element-wise multiplication
+                epoch_test_preds.append(strategy_returns)  # Append the array
         
         avg_test_loss = total_test_loss / len(test_loader)
         test_losses.append(avg_test_loss)
@@ -271,39 +237,46 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
         
         scheduler.step(test_sharpe)
         
-        # Save best model
+        # Save best model and predictions
         if test_sharpe > best_test_sharpe:
             best_test_sharpe = test_sharpe
             torch.save(model.state_dict(), 'best_model.pth')
+            # Concatenate all batch predictions into a single array
+            best_test_predictions = np.concatenate(epoch_test_preds, axis=0)
         
-        if epoch % 10 == 0 or epoch == epochs - 1:
+        if epoch % 2 == 0 or epoch == epochs - 1:
             print(f"Epoch {epoch+1}/{epochs}, "
                   f"Loss: {avg_loss:.4f}, "
                   f"Train Sharpe: {train_sharpe:.4f}, "
                   f"Test Sharpe: {test_sharpe:.4f}")
     
-    return train_losses, test_losses, train_sharpes, test_sharpes
-
+    return (train_losses, test_losses, train_sharpes, test_sharpes, 
+            pd.Series(best_test_predictions.flatten()))
 
 def evaluate_sharpe(model, loader):
-    """
-    Simplified Sharpe ratio evaluation
+    """Evaluate Sharpe ratio on a given data loader.
+    
+    Args:
+        model: PyTorch model
+        loader: DataLoader containing batches of (x_num, x_cat, y)
+        
+    Returns:
+        Sharpe ratio (float)
     """
     model.eval()
-    all_returns = []
+    port_returns = []
     
     with torch.no_grad():
         for x_num, x_cat, y in loader:
             preds = model(x_num, x_cat)
-            port_returns = preds * y
-            all_returns.append(port_returns)
+            port_returns.append(preds * y)
     
-    all_returns = torch.cat(all_returns, dim=0)
-    mean_ret = torch.mean(all_returns)
-    std_ret = torch.std(all_returns)
-    sharpe = mean_ret / (std_ret + 1e-8)
+    port_returns = torch.cat(port_returns)
+    mean_ret = port_returns.mean()
+    std_ret = port_returns.std()
+    sharpe = mean_ret / (std_ret + 1e-8)  # Small epsilon to avoid division by zero
     
-    return float(sharpe)
+    return sharpe.item()
 
 def plot_train_vs_test(epochs, train_losses, test_losses):
   plt.plot(epochs, train_losses, label='Train Loss (neg Sharpe)')
@@ -340,6 +313,147 @@ def plot_results_1(epochs, train_losses, train_sharpes, test_sharpes):
 
   plt.tight_layout()
   plt.show()
+
+def merge_pls_with_asof(daily_returns, pls_data):
+    """
+    Merge PLS index data to daily returns using merge_asof with forward filling.
+    
+    This function handles the sorting requirements properly and processes each
+    PERMNO separately to avoid sorting issues with merge_asof.
+    
+    Parameters:
+    -----------
+    daily_returns : DataFrame
+        Daily returns data with columns: date, PERMNO, DlyRet, etc.
+    pls_data : DataFrame  
+        Monthly PLS index data with columns: date, PERMNO, pls_index
+    
+    Returns:
+    --------
+    DataFrame
+        Merged dataframe with forward-filled pls_index values
+    """
+    
+    # Make copies to avoid modifying original data
+    daily_df = daily_returns.copy()
+    pls_df = pls_data.copy()
+    
+    # Ensure date columns are datetime
+    daily_df['date'] = pd.to_datetime(daily_df['date'])
+    pls_df['date'] = pd.to_datetime(pls_df['date'])
+    
+    # Get unique PERMNOs from both datasets
+    daily_permnos = set(daily_df['PERMNO'].unique())
+    pls_permnos = set(pls_df['PERMNO'].unique())
+    common_permnos = daily_permnos & pls_permnos
+    
+    print(f"Processing {len(common_permnos)} common PERMNOs...")
+    
+    # Process each PERMNO separately to ensure proper sorting
+    merged_parts = []
+    
+    for i, permno in enumerate(common_permnos):
+        if i % 1000 == 0:  # Progress indicator
+            print(f"Processing PERMNO {i+1}/{len(common_permnos)}")
+        
+        # Get data for this PERMNO and sort by date
+        daily_subset = daily_df[daily_df['PERMNO'] == permno].sort_values('date')
+        pls_subset = pls_df[pls_df['PERMNO'] == permno].sort_values('date')
+        
+        if len(pls_subset) > 0:
+            # Perform merge_asof for this PERMNO
+            merged_subset = pd.merge_asof(
+                daily_subset,
+                pls_subset[['date', 'pls_index']],
+                on='date',
+                direction='backward'  # Forward fill: use most recent available value
+            )
+            merged_parts.append(merged_subset)
+    
+    # Handle PERMNOs that exist in daily data but not in PLS data
+    permnos_without_pls = daily_permnos - pls_permnos
+    if permnos_without_pls:
+        print(f"Adding {len(permnos_without_pls)} PERMNOs without PLS data...")
+        for permno in permnos_without_pls:
+            daily_subset = daily_df[daily_df['PERMNO'] == permno].copy()
+            daily_subset['pls_index'] = np.nan
+            merged_parts.append(daily_subset)
+    
+    # Combine all parts
+    print("Combining results...")
+    merged_df = pd.concat(merged_parts, ignore_index=True)
+    
+    # Restore original order if needed
+    merged_df = merged_df.sort_values(['date', 'PERMNO']).reset_index(drop=True)
+    
+    return merged_df
+
+def check_merge_quality(merged_df, original_daily_df):
+    """
+    Check the quality of the merge operation.
+    
+    Parameters:
+    -----------
+    merged_df : DataFrame
+        Result from merge operation
+    original_daily_df : DataFrame
+        Original daily returns dataframe
+    """
+    
+    print("\n" + "="*50)
+    print("MERGE QUALITY REPORT")
+    print("="*50)
+    
+    print(f"Original daily rows: {len(original_daily_df):,}")
+    print(f"Merged rows: {len(merged_df):,}")
+    print(f"Rows with PLS data: {merged_df['pls_index'].notna().sum():,}")
+    print(f"Rows missing PLS data: {merged_df['pls_index'].isna().sum():,}")
+    print(f"Coverage: {(merged_df['pls_index'].notna().sum() / len(merged_df)) * 100:.1f}%")
+    
+    # Check for duplicates
+    duplicates = merged_df.duplicated(subset=['date', 'PERMNO']).sum()
+    print(f"Duplicate (date, PERMNO) pairs: {duplicates}")
+    
+    # Sample check - show forward fill working
+    print(f"\nSample forward fill check:")
+    sample_permno = merged_df[merged_df['pls_index'].notna()]['PERMNO'].iloc[0]
+    sample_data = merged_df[merged_df['PERMNO'] == sample_permno].head(10)
+    print(sample_data[['date', 'PERMNO', 'DlyRet', 'pls_index']].to_string())
+    
+    # Check date range coverage
+    print(f"\nDate range:")
+    print(f"Daily data: {merged_df['date'].min()} to {merged_df['date'].max()}")
+    pls_dates = merged_df[merged_df['pls_index'].notna()]['date']
+    if len(pls_dates) > 0:
+        print(f"PLS data: {pls_dates.min()} to {pls_dates.max()}")
+
+
+# Quick test function to verify the logic
+def test_merge_logic():
+    """
+    Test the merge logic with sample data
+    """
+    # Create sample data
+    daily_sample = pd.DataFrame({
+        'date': pd.date_range('2000-01-01', '2000-01-31', freq='D'),
+        'PERMNO': [10001] * 31,
+        'DlyRet': np.random.normal(0, 0.02, 31)
+    })
+    
+    pls_sample = pd.DataFrame({
+        'date': ['2000-01-01', '2000-01-15'],
+        'PERMNO': [10001, 10001],
+        'pls_index': [-1.5, -2.0]
+    })
+    pls_sample['date'] = pd.to_datetime(pls_sample['date'])
+    
+    # Test merge
+    result = merge_pls_with_asof(daily_sample, pls_sample)
+    
+    print("Test Results:")
+    print(result[['date', 'PERMNO', 'DlyRet', 'pls_index']].head(20))
+    
+    return result
 
 
 
