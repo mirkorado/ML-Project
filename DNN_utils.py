@@ -200,7 +200,8 @@ def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rat
     print(f"Starting training with {len(train_loader)} train batches, {len(test_loader)} test batches")
 
     train_losses, test_losses, train_sharpes, test_sharpes, strat_returns, weights = train_model(
-        model, train_loader, test_loader, optimizer, scheduler, epochs=epochs
+        model, train_loader, test_loader, optimizer, scheduler, epochs=epochs, max_weight=max_weight, 
+        diversification_lambda=diversification_lambda, temperature=temperature
     )
 
     print(f"Training completed! Best test Sharpe ratio: {max(test_sharpes):.4f}")
