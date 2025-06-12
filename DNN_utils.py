@@ -176,7 +176,7 @@ def sharpe_ratio_loss(y_pred, y_true, eps=1e-6):
     return -sharpe
 
 
-def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rate=0.001):
+def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rate=0.001, max_weight=0.05, diversification_lambda=0.5, temperature=0.3):
     
     TRAIN_BATCH_SIZE = 2048
     TEST_BATCH_SIZE = 4096
@@ -199,14 +199,14 @@ def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rat
 
     print(f"Starting training with {len(train_loader)} train batches, {len(test_loader)} test batches")
 
-    train_losses, test_losses, train_sharpes, test_sharpes, strat_returns = train_model(
+    train_losses, test_losses, train_sharpes, test_sharpes, strat_returns, weights = train_model(
         model, train_loader, test_loader, optimizer, scheduler, epochs=epochs
     )
 
     print(f"Training completed! Best test Sharpe ratio: {max(test_sharpes):.4f}")
-    return train_losses, test_losses, train_sharpes, test_sharpes, strat_returns
+    return train_losses, test_losses, train_sharpes, test_sharpes, strat_returns, weights
 
-
+'''
 def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=50):
     """
     Simplified training loop without unnecessary optimizations
@@ -281,7 +281,174 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
     
     return (train_losses, test_losses, train_sharpes, test_sharpes, 
             pd.Series(best_test_predictions.flatten()))
+'''
 
+def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=50, max_weight=0.05, diversification_lambda=0.5, temperature=0.3):
+    """
+    Training loop with diversified Sharpe ratio loss.
+    Returns test predictions from the epoch with highest Sharpe ratio.
+    """
+    train_losses = []
+    test_losses = []
+    train_sharpes = []
+    test_sharpes = []
+    
+    best_test_sharpe = float('-inf')
+    best_test_predictions = None
+    best_test_weights = None  # Store weights for analysis
+    
+    # Hyperparameters for diversified loss
+    #max_weight = 0.05  # No stock >5% weight
+    #diversification_lambda = 0.5  # Strength of penalty
+    #temperature = 0.3  # Softmax temperature (lower = more diversification)
+
+    for epoch in tqdm(range(epochs), desc="Training"):
+        # Training phase
+        model.train()
+        total_loss = 0
+        
+        for x_num, x_cat, y in train_loader:
+            optimizer.zero_grad()
+            
+            outputs = model(x_num, x_cat)
+            
+            # ------ Modified Sharpe Loss ------
+            # 1. Apply tempered softmax
+            weights = F.softmax(outputs / temperature, dim=0)
+            
+            # 2. Penalize weights > max_weight
+            weight_penalty = torch.sum(F.relu(weights - max_weight))
+            
+            # 3. Entropy penalty (encourage diversification)
+            entropy = -torch.sum(weights * torch.log(weights + 1e-6))
+            entropy_penalty = -entropy
+            
+            # 4. Portfolio returns and Sharpe
+            port_returns = weights * y
+            mean_return = port_returns.mean()
+            std_return = port_returns.std()
+            sharpe = mean_return / (std_return + 1e-6)
+            
+            # 5. Combined loss
+            loss = -sharpe + diversification_lambda * (weight_penalty + entropy_penalty)
+            # --------------------------------
+            
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(train_loader)
+        train_losses.append(avg_loss)
+        
+        # Evaluation phase
+        model.eval()
+        total_test_loss = 0
+        epoch_test_preds = []
+        epoch_test_weights = []
+        
+        with torch.no_grad():
+            for x_num, x_cat, y in test_loader:
+                outputs = model(x_num, x_cat)
+                weights = F.softmax(outputs / temperature, dim=0)
+                
+                # Compute test loss (same as training)
+                weight_penalty = torch.sum(F.relu(weights - max_weight))
+                entropy = -torch.sum(weights * torch.log(weights + 1e-6))
+                port_returns = weights * y
+                sharpe = port_returns.mean() / (port_returns.std() + 1e-6)
+                loss = -sharpe + diversification_lambda * (weight_penalty - entropy)
+                
+                total_test_loss += loss.item()
+                epoch_test_preds.append(outputs.cpu().numpy())
+                epoch_test_weights.append(weights.cpu().numpy())  # Store weights
+        
+        avg_test_loss = total_test_loss / len(test_loader)
+        test_losses.append(avg_test_loss)
+        
+        # Sharpe evaluation (using actual weighted returns)
+        train_sharpe = evaluate_sharpe_diversified(model, train_loader, temperature, max_weight)
+        test_sharpe = evaluate_sharpe_diversified(model, test_loader, temperature, max_weight)
+        
+        train_sharpes.append(train_sharpe)
+        test_sharpes.append(test_sharpe)
+        
+        scheduler.step(test_sharpe)
+        
+        # Save best model and predictions
+        if test_sharpe > best_test_sharpe:
+            best_test_sharpe = test_sharpe
+            torch.save(model.state_dict(), 'best_model.pth')
+            best_test_predictions = np.concatenate(epoch_test_preds, axis=0)
+            best_test_weights = np.concatenate(epoch_test_weights, axis=0)
+        
+        # Print diagnostics every few epochs
+        if epoch % 2 == 0 or epoch == epochs - 1:
+            avg_weight = np.mean(best_test_weights) if best_test_weights is not None else 0
+            max_w = np.max(best_test_weights) if best_test_weights is not None else 0
+            print(f"Epoch {epoch+1}/{epochs}, "
+                  f"Loss: {avg_loss:.4f}, "
+                  f"Train Sharpe: {train_sharpe:.4f}, "
+                  f"Test Sharpe: {test_sharpe:.4f}, "
+                  f"Avg Weight: {avg_weight:.4f}, "
+                  f"Max Weight: {max_w:.4f}")
+
+    return (
+        train_losses, 
+        test_losses, 
+        train_sharpes, 
+        test_sharpes, 
+        pd.Series(best_test_predictions.flatten()),
+        pd.Series(best_test_weights)  # Return weights for analysis
+    )
+
+def evaluate_sharpe_diversified(model, loader, temperature=0.3, max_weight=0.05):
+    """Evaluates Sharpe ratio using tempered softmax weights."""
+    model.eval()
+    port_returns = []
+    
+    with torch.no_grad():
+        for x_num, x_cat, y in loader:
+            outputs = model(x_num, x_cat)
+            weights = F.softmax(outputs / temperature, dim=0)
+            port_returns.append(weights * y)
+    
+    port_returns = torch.cat(port_returns)
+    mean_ret = port_returns.mean()
+    std_ret = port_returns.std()
+    return (mean_ret / (std_ret + 1e-6)).item()
+    
+def sharpe_ratio_loss(y_pred, y_true, max_weight=0.05, diversification_lambda=0.5, eps=1e-6):
+    """
+    Args:
+        y_pred: Raw predictions (before softmax)
+        y_true: Actual returns
+        max_weight: Maximum allowed weight for any single stock (e.g., 5%)
+        diversification_lambda: Strength of the diversification penalty (0.5 is a good start)
+        eps: Small value to avoid division by zero
+    """
+    # 1. Apply tempered softmax to get weights (lower temperature = more diversified)
+    temperature = 0.3  # Lower = more uniform weights
+    weights = F.softmax(y_pred / temperature, dim=0)
+    
+    # 2. Penalize weights exceeding max_weight
+    weight_penalty = torch.sum(F.relu(weights - max_weight))
+    
+    # 3. Add entropy penalty to encourage diversification (higher entropy = more diversified)
+    entropy = -torch.sum(weights * torch.log(weights + eps))
+    entropy_penalty = -entropy  # We want to maximize entropy
+    
+    # 4. Compute portfolio returns and Sharpe ratio
+    port_returns = weights * y_true
+    mean_return = port_returns.mean()
+    std_return = port_returns.std()
+    sharpe = mean_return / (std_return + eps)
+    
+    # 5. Combine Sharpe with penalties
+    loss = -sharpe + diversification_lambda * (weight_penalty + entropy_penalty)
+    
+    return loss
+
+'''
 def evaluate_sharpe(model, loader):
     """Evaluate Sharpe ratio on a given data loader.
     
@@ -306,7 +473,7 @@ def evaluate_sharpe(model, loader):
     sharpe = mean_ret / (std_ret + 1e-8)  # Small epsilon to avoid division by zero
     
     return sharpe.item()
-
+'''
 def plot_train_vs_test(epochs, train_losses, test_losses):
   plt.plot(epochs, train_losses, label='Train Loss (neg Sharpe)')
   plt.plot(epochs, test_losses, label='Test Loss (neg Sharpe)')
