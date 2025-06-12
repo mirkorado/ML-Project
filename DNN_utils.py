@@ -26,24 +26,22 @@ def prepare_data(train_df, test_df, lagged_num=5, rolling_window = False):
 
     # Shift returns to create lagged features; keep NaNs for first few rows
     for i in range(lagged_num):
-        train_df[f'DlyRet_lag{i+1}'] = train_df.groupby('PERMNO')['DlyRet'].shift(i+1)
-        train_df[f'DlyRet_lag{i+1}'] = train_df[f'DlyRet_lag{i+1}'].fillna(train_df[f'DlyRet_lag{i+1}'].mean())
-        test_df[f'DlyRet_lag{i+1}'] = test_df.groupby('PERMNO')['DlyRet'].shift(i+1)
-        test_df[f'DlyRet_lag{i+1}'] = test_df[f'DlyRet_lag{i+1}'].fillna(test_df[f'DlyRet_lag{i+1}'].mean())
+        train_df[f'DlyRet_lag{i+1}'] = train_df.groupby('PERMNO')['DlyRet'].shift(i+1).fillna(0.0)
+        test_df[f'DlyRet_lag{i+1}'] = test_df.groupby('PERMNO')['DlyRet'].shift(i+1).fillna(0.0)
 
     if rolling_window == True:
         for i in range(3):
             window = (i + 1) * 10
             train_df[f'DlyRet_roll_{window}'] = (
                 train_df
-                .groupby('PERMNO')['DlyRet']
-                .transform(lambda x: x.rolling(window=window, min_periods=1).mean())
+                .groupby('PERMNO')['DlyRet_lag1']
+                .transform(lambda x: x.rolling(window=window, min_periods=1).mean().fillna(0.0))
             )
 
             test_df[f'DlyRet_roll_{window}'] = (
                 test_df
-                .groupby('PERMNO')['DlyRet']
-                .transform(lambda x: x.rolling(window=window, min_periods=1).mean())
+                .groupby('PERMNO')['DlyRet_lag1']
+                .transform(lambda x: x.rolling(window=window, min_periods=1).mean().fillna(0.0))
             )
 
     # Encode categorical columns for embeddings
@@ -53,9 +51,9 @@ def prepare_data(train_df, test_df, lagged_num=5, rolling_window = False):
         train_df[col] = train_df[col].cat.codes
         test_df[col] = test_df[col].astype('category')
         test_df[col] = test_df[col].cat.codes
-
+    
     # Feature lists
-    remove_columns = ['PERMCO', 'year_month', 'NAICS', 'date', 'SICCD', 'PERMNO']  # Unused in DNN
+    remove_columns = ['PERMCO', 'year_month', 'NAICS', 'date', 'SICCD', 'PERMNO', 'DlyRet']  # Unused for training
     features = train_df.columns.tolist()
     features = [col for col in features if col not in remove_columns]
     print(features)
@@ -68,11 +66,11 @@ def prepare_data(train_df, test_df, lagged_num=5, rolling_window = False):
 
 # Dataset class
 class FinancialDataset(Dataset):
-    # Use float16 for low memory usage and training speedup 
+    # Use float32 for low memory usage and training speedup 
     def __init__(self, df, features, cat_features, target_col='DlyRet'):
-        self.X_num = df[features].values.astype(np.float16)
+        self.X_num = df[features].values.astype(np.float32)
         self.X_cat = df[cat_features].values.astype(np.int32)
-        self.y = df[target_col].values.astype(np.float16)
+        self.y = df[target_col].values.astype(np.float32)
 
     def __len__(self):
         return len(self.y)
@@ -156,7 +154,7 @@ def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rat
     train_dataset = FinancialDataset(train_df, features, cat_features)
     test_dataset = FinancialDataset(test_df, features, cat_features)
 
-    train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=TEST_BATCH_SIZE, shuffle=False)
 
     # Model setup
@@ -222,7 +220,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
                 
                 # Store strategy returns for each sample in the batch
                 # Remember we use predictions as weights and multiply with the realised returns
-                strategy_returns = outputs.cpu().numpy() * y.cpu().numpy()  # Element-wise multiplication
+                strategy_returns = outputs.cpu().numpy() #* y.cpu().numpy()  # Element-wise multiplication
                 epoch_test_preds.append(strategy_returns)  # Append the array
         
         avg_test_loss = total_test_loss / len(test_loader)
