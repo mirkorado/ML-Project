@@ -14,6 +14,37 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
+def read_daily_returns(path, nrows=None, low_quantile=0.005, up_quantile=0.995):
+
+    # Read data
+    daily = pd.read_csv(path, nrows=nrows)
+    
+    # Ensure datetime format for dates and align with predictors data set start date
+    daily['date'] = pd.to_datetime(daily['date'], format = "%Y-%m-%d") 
+    daily = daily[daily['date'] >= '2000-01-31'] 
+
+    # Remove outliers
+    # Compute quantile thresholds for winsorization
+    lower_quantile = daily['DlyRet'].quantile(low_quantile)
+    upper_quantile = daily['DlyRet'].quantile(up_quantile)
+
+    # Identify outliers for reporting
+    outliers = (daily['DlyRet'] < lower_quantile) | (daily['DlyRet'] > upper_quantile)
+    #print(f"Number of daily return outliers: {outliers.sum():,}")
+
+    # Winsorize: cap values at the quantile thresholds
+    daily['DlyRet'] = daily['DlyRet'].clip(lower=lower_quantile, upper=upper_quantile)
+    
+    # Create lagged return for the S&P 500 index 
+    sp500_lagged = daily[['date', 'sprtrn']].drop_duplicates().sort_values('date')
+    sp500_lagged['sprtrn_lag1'] = sp500_lagged['sprtrn'].shift(1).fillna(0.0)
+    
+    # Merge lagged S&P 500 return back into main DataFrame
+    daily = daily.merge(sp500_lagged[['date', 'sprtrn_lag1']], on='date', how='left')
+
+    return daily
+
+
 def prepare_data(train_df, test_df, lagged_num=5, rolling_window = False):
     '''
     Prepares the train and test data frames by creating lagged returns and encoding 
@@ -53,7 +84,7 @@ def prepare_data(train_df, test_df, lagged_num=5, rolling_window = False):
         test_df[col] = test_df[col].cat.codes
     
     # Feature lists
-    remove_columns = ['PERMCO', 'year_month', 'NAICS', 'date', 'SICCD', 'PERMNO', 'DlyRet']  # Unused for training
+    remove_columns = ['PERMCO', 'year_month', 'NAICS', 'date', 'SICCD', 'PERMNO', 'DlyRet', 'sprtrn']  # Unused for training
     features = train_df.columns.tolist()
     features = [col for col in features if col not in remove_columns]
     print(features)
