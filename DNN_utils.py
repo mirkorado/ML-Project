@@ -14,6 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
+'''
 def progressive_cost(weight_change):
     if weight_change < 0.01:  # Small trade no impact 
         return weight_change
@@ -21,6 +22,16 @@ def progressive_cost(weight_change):
         return 1.5 * weight_change
     else:  # Large trade
         return 2.0 * weight_change
+        '''
+
+def progressive_cost(weight_change, base_tc=0.003, alpha=10):
+    """
+    Penalizes weight changes progressively.
+    - base_tc: base transaction cost rate (e.g., 0.001)
+    - alpha: aggressiveness of penalty on large trades
+    """
+    return base_tc * (weight_change + alpha * weight_change**2)
+
 
 def read_daily_returns(path, nrows=None, low_quantile=0.005, up_quantile=0.995):
 
@@ -184,7 +195,8 @@ def sharpe_ratio_loss(y_pred, y_true, eps=1e-6):
     return -sharpe
 
 
-def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rate=0.001, max_weight=0.05, diversification_lambda=0.5, temperature=0.3):
+def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rate=0.001, 
+              max_weight=0.05, diversification_lambda=0.5, temperature=0.3, loss_function = 'softmax_reg'):
     
     TRAIN_BATCH_SIZE = 2048
     TEST_BATCH_SIZE = 4096
@@ -207,18 +219,31 @@ def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rat
 
     print(f"Starting training with {len(train_loader)} train batches, {len(test_loader)} test batches")
 
-    train_losses, test_losses, train_sharpes, test_sharpes, strat_returns, weights = train_model(
-        model, train_loader, test_loader, optimizer, scheduler, epochs=epochs, max_weight=max_weight, 
-        diversification_lambda=diversification_lambda, temperature=temperature
-    )
+    if loss_function == 'softmax_reg':
+        train_losses, test_losses, train_sharpes, test_sharpes, strat_returns, weights = train_model(
+            model, train_loader, test_loader, optimizer, scheduler, epochs=epochs, max_weight=max_weight, 
+            diversification_lambda=diversification_lambda, temperature=temperature
+        )
+    elif loss_function == 'neg_sharpe':
+        train_losses, test_losses, train_sharpes, test_sharpes, strat_returns = train_model_negative_sharpe(
+            model, train_loader, test_loader, optimizer, scheduler, epochs=epochs
+        )
+        weights = None
+    elif loss_function == 'lin_rank':
+        train_losses, test_losses, train_sharpes, test_sharpes, strat_returns, weights = train_model_rank(
+            model, train_loader, test_loader, optimizer, scheduler, epochs=epochs, top_k=0.1
+        )
+    else:
+        raise ValueError("Unknown loss function. Implemented loss functions are: softmax_reg ; neg_sharpe ; lin_rank")
 
+    
     print(f"Training completed! Best test Sharpe ratio: {max(test_sharpes):.4f}")
     return train_losses, test_losses, train_sharpes, test_sharpes, strat_returns, weights
 
-'''
-def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=50):
+
+
+def train_model_negative_sharpe(model, train_loader, test_loader, optimizer, scheduler, epochs=50):
     """
-    Simplified training loop without unnecessary optimizations
     Returns test predictions from the epoch with highest Sharpe ratio as pandas Series
     """
     train_losses = []
@@ -238,7 +263,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
             optimizer.zero_grad()
             
             outputs = model(x_num, x_cat)
-            loss = sharpe_ratio_loss(outputs, y)
+            loss = neg_sharpe_ratio_loss(outputs, y)
             loss.backward()
             optimizer.step()
             
@@ -255,12 +280,12 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
         with torch.no_grad():
             for x_num, x_cat, y in test_loader:
                 outputs = model(x_num, x_cat)
-                loss = sharpe_ratio_loss(outputs, y)
+                loss = neg_sharpe_ratio_loss(outputs, y)
                 total_test_loss += loss.item()
                 
                 # Store strategy returns for each sample in the batch
                 # Remember we use predictions as weights and multiply with the realised returns
-                strategy_returns = outputs.cpu().numpy() #* y.cpu().numpy()  # Element-wise multiplication
+                strategy_returns = outputs.cpu().numpy() # Element-wise multiplication
                 epoch_test_preds.append(strategy_returns)  # Append the array
         
         avg_test_loss = total_test_loss / len(test_loader)
@@ -278,7 +303,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
         # Save best model and predictions
         if test_sharpe > best_test_sharpe:
             best_test_sharpe = test_sharpe
-            torch.save(model.state_dict(), 'best_model.pth')
+            #torch.save(model.state_dict(), 'best_model.pth')
             # Concatenate all batch predictions into a single array
             best_test_predictions = np.concatenate(epoch_test_preds, axis=0)
         
@@ -290,7 +315,39 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
     
     return (train_losses, test_losses, train_sharpes, test_sharpes, 
             pd.Series(best_test_predictions.flatten()))
-'''
+
+def neg_sharpe_ratio_loss(y_pred, y_true, eps=1e-6):
+    port_returns = y_pred * y_true
+    mean = port_returns.mean()
+    std = port_returns.std()
+    sharpe = mean / (std + eps)
+    return -sharpe
+
+def evaluate_sharpe(model, loader):
+    """Evaluate Sharpe ratio on a given data loader.
+    
+    Args:
+        model: PyTorch model
+        loader: DataLoader containing batches of (x_num, x_cat, y)
+        
+    Returns:
+        Sharpe ratio (float)
+    """
+    model.eval()
+    port_returns = []
+    
+    with torch.no_grad():
+        for x_num, x_cat, y in loader:
+            preds = model(x_num, x_cat)
+            port_returns.append(preds * y)
+    
+    port_returns = torch.cat(port_returns)
+    mean_ret = port_returns.mean()
+    std_ret = port_returns.std()
+    sharpe = mean_ret / (std_ret + 1e-8)  # Small epsilon to avoid division by zero
+    
+    return sharpe.item()
+
 
 def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=50, max_weight=0.05, diversification_lambda=0.5, temperature=0.3):
     """
@@ -306,11 +363,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
     best_test_predictions = None
     best_test_weights = None  # Store weights for analysis
     
-    # Hyperparameters for diversified loss
-    #max_weight = 0.05  # No stock >5% weight
-    #diversification_lambda = 0.5  # Strength of penalty
-    #temperature = 0.3  # Softmax temperature (lower = more diversification)
-
+    
     for epoch in tqdm(range(epochs), desc="Training"):
         # Training phase
         model.train()
@@ -340,7 +393,6 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
             
             # 5. Combined loss
             loss = -sharpe + diversification_lambda * (weight_penalty + entropy_penalty)
-            # --------------------------------
             
             loss.backward()
             optimizer.step()
@@ -457,32 +509,169 @@ def sharpe_ratio_loss(y_pred, y_true, max_weight=0.05, diversification_lambda=0.
     
     return loss
 
-'''
-def evaluate_sharpe(model, loader):
-    """Evaluate Sharpe ratio on a given data loader.
-    
-    Args:
-        model: PyTorch model
-        loader: DataLoader containing batches of (x_num, x_cat, y)
-        
-    Returns:
-        Sharpe ratio (float)
+
+
+def train_model_rank(model, train_loader, test_loader, optimizer, scheduler, epochs=50, top_k=0.1):
     """
+    Training loop with linear rank-based loss.
+    Returns test predictions from the epoch with highest Sharpe ratio.
+    Args:
+        top_k: Fraction of top stocks to select (e.g., 0.1 = top 10%)
+    """
+    train_losses = []
+    test_losses = []
+    train_sharpes = []
+    test_sharpes = []
+    
+    best_test_sharpe = float('-inf')
+    best_test_predictions = None
+    best_test_weights = None
+
+    for epoch in tqdm(range(epochs), desc="Training"):
+        # Training phase
+        model.train()
+        total_loss = 0
+        
+        for x_num, x_cat, y in train_loader:
+            optimizer.zero_grad()
+            
+            outputs = model(x_num, x_cat)
+            
+            # ------ Linear Rank Loss ------
+            # 1. Get smoothed ranks (differentiable approximation)
+            ranks = smooth_rank(outputs)
+            
+            # 2. Select top_k% of stocks
+            k = int(len(outputs) * top_k)
+            top_mask = ranks >= (len(outputs) - k)
+            
+            # 3. Assign linear weights based on rank
+            weights = torch.zeros_like(outputs)
+            if top_mask.sum() > 0:  # Avoid division by zero
+                weights[top_mask] = (ranks[top_mask] - (len(outputs) - k) + 1)
+                weights = weights / weights.sum()
+            
+            # 4. Portfolio returns and Sharpe
+            port_returns = weights * y
+            mean_return = port_returns.mean()
+            std_return = port_returns.std()
+            sharpe = mean_return / (std_return + 1e-6)
+            
+            # 5. Loss is negative Sharpe
+            loss = -sharpe
+            
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(train_loader)
+        train_losses.append(avg_loss)
+        
+        # Evaluation phase
+        model.eval()
+        total_test_loss = 0
+        epoch_test_preds = []
+        epoch_test_weights = []
+        
+        with torch.no_grad():
+            for x_num, x_cat, y in test_loader:
+                outputs = model(x_num, x_cat)
+                ranks = smooth_rank(outputs)
+                k = int(len(outputs) * top_k)
+                top_mask = ranks >= (len(outputs) - k)
+                
+                weights = torch.zeros_like(outputs)
+                if top_mask.sum() > 0:
+                    weights[top_mask] = (ranks[top_mask] - (len(outputs) - k) + 1)
+                    weights = weights / weights.sum()
+                
+                # Compute test loss
+                port_returns = weights * y
+                sharpe = port_returns.mean() / (port_returns.std() + 1e-6)
+                loss = -sharpe
+                
+                total_test_loss += loss.item()
+                epoch_test_preds.append(outputs.cpu().numpy())
+                epoch_test_weights.append(weights.cpu().numpy())
+        
+        avg_test_loss = total_test_loss / len(test_loader)
+        test_losses.append(avg_test_loss)
+        
+        # Sharpe evaluation
+        train_sharpe = evaluate_rank_sharpe(model, train_loader, top_k)
+        test_sharpe = evaluate_rank_sharpe(model, test_loader, top_k)
+        
+        train_sharpes.append(train_sharpe)
+        test_sharpes.append(test_sharpe)
+        
+        scheduler.step(test_sharpe)
+        
+        # Save best model and predictions
+        if test_sharpe > best_test_sharpe:
+            best_test_sharpe = test_sharpe
+            torch.save(model.state_dict(), 'best_model.pth')
+            best_test_predictions = np.concatenate(epoch_test_preds, axis=0)
+            best_test_weights = np.concatenate(epoch_test_weights, axis=0)
+        
+        # Print diagnostics
+        if epoch % 2 == 0 or epoch == epochs - 1:
+            avg_weight = np.mean(best_test_weights) if best_test_weights is not None else 0
+            max_w = np.max(best_test_weights) if best_test_weights is not None else 0
+            print(f"Epoch {epoch+1}/{epochs}, "
+                  f"Loss: {avg_loss:.4f}, "
+                  f"Train Sharpe: {train_sharpe:.4f}, "
+                  f"Test Sharpe: {test_sharpe:.4f}, "
+                  f"Avg Weight: {avg_weight:.4f}, "
+                  f"Max Weight: {max_w:.4f}")
+
+    return (
+        train_losses, 
+        test_losses, 
+        train_sharpes, 
+        test_sharpes, 
+        pd.Series(best_test_predictions.flatten()),
+        pd.Series(best_test_weights.flatten()) if best_test_weights is not None else None
+    )
+
+
+def smooth_rank(x, alpha=0.01):
+    """Differentiable approximation of ranks using sigmoid.
+    Args:
+        x: Tensor of raw predictions
+        alpha: Smoothing parameter (smaller = sharper ranking)
+    Returns:
+        Approximate ranks (higher values = higher rank)
+    """
+    pairwise_diff = x.unsqueeze(1) - x.unsqueeze(0)
+    ranks = torch.sigmoid(pairwise_diff / alpha).sum(dim=1)
+    return ranks
+
+
+def evaluate_rank_sharpe(model, loader, top_k):
+    """Evaluate Sharpe ratio using rank-based weights."""
     model.eval()
     port_returns = []
     
     with torch.no_grad():
         for x_num, x_cat, y in loader:
-            preds = model(x_num, x_cat)
-            port_returns.append(preds * y)
+            outputs = model(x_num, x_cat)
+            ranks = smooth_rank(outputs) # Use smooth ranks for differentiability
+            k = int(len(outputs) * top_k)
+            top_mask = ranks >= (len(outputs) - k)
+            
+            weights = torch.zeros_like(outputs)
+            if top_mask.sum() > 0:
+                weights[top_mask] = (ranks[top_mask] - (len(outputs) - k) + 1)
+                weights = weights / weights.sum()
+            
+            port_returns.append(weights * y)
     
     port_returns = torch.cat(port_returns)
     mean_ret = port_returns.mean()
     std_ret = port_returns.std()
-    sharpe = mean_ret / (std_ret + 1e-8)  # Small epsilon to avoid division by zero
-    
-    return sharpe.item()
-'''
+    return (mean_ret / (std_ret + 1e-6)).item()
+
+
 def plot_train_vs_test(epochs, train_losses, test_losses):
   plt.plot(epochs, train_losses, label='Train Loss (neg Sharpe)')
   plt.plot(epochs, test_losses, label='Test Loss (neg Sharpe)')
