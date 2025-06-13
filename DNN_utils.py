@@ -14,15 +14,16 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
-'''
-def progressive_cost(weight_change):
-    if weight_change < 0.01:  # Small trade no impact 
-        return weight_change
-    elif weight_change < 0.05:  # Medium trade small impact 
-        return 1.5 * weight_change
-    else:  # Large trade
-        return 2.0 * weight_change
-        '''
+
+def compute_monthly_sharpe(returns):
+    # Multiply by sqrt(21) to get monthly Sharpe ratio
+    sharpe_ratio = (returns.mean() / (returns.std() + 1e-8)) * np.sqrt(21)
+    return sharpe_ratio
+
+def compute_sharpe(returns):
+    # Multiply by sqrt(252) to get annualized Sharpe ratio
+    sharpe_ratio = (returns.mean() / (returns.std() + 1e-8)) * np.sqrt(252)
+    return sharpe_ratio
 
 def progressive_cost(weight_change, base_tc=0.003, alpha=10):
     """
@@ -310,8 +311,8 @@ def train_model_negative_sharpe(model, train_loader, test_loader, optimizer, sch
         if epoch % 2 == 0 or epoch == epochs - 1:
             print(f"Epoch {epoch+1}/{epochs}, "
                   f"Loss: {avg_loss:.4f}, "
-                  f"Train Sharpe: {train_sharpe:.4f}, "
-                  f"Test Sharpe: {test_sharpe:.4f}")
+                  f"Train fit: {train_sharpe:.4f}, "
+                  f"Test fit: {test_sharpe:.4f}")
     
     return (train_losses, test_losses, train_sharpes, test_sharpes, 
             pd.Series(best_test_predictions.flatten()))
@@ -438,7 +439,7 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
         # Save best model and predictions
         if test_sharpe > best_test_sharpe:
             best_test_sharpe = test_sharpe
-            torch.save(model.state_dict(), 'best_model.pth')
+            #torch.save(model.state_dict(), 'best_model.pth')
             best_test_predictions = np.concatenate(epoch_test_preds, axis=0)
             best_test_weights = np.concatenate(epoch_test_weights, axis=0)
         
@@ -448,8 +449,8 @@ def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs=5
             max_w = np.max(best_test_weights) if best_test_weights is not None else 0
             print(f"Epoch {epoch+1}/{epochs}, "
                   f"Loss: {avg_loss:.4f}, "
-                  f"Train Sharpe: {train_sharpe:.4f}, "
-                  f"Test Sharpe: {test_sharpe:.4f}, "
+                  f"Train fit: {train_sharpe:.4f}, "
+                  f"Test fit: {test_sharpe:.4f}, "
                   f"Avg Weight: {avg_weight:.4f}, "
                   f"Max Weight: {max_w:.4f}")
 
@@ -609,7 +610,7 @@ def train_model_rank(model, train_loader, test_loader, optimizer, scheduler, epo
         # Save best model and predictions
         if test_sharpe > best_test_sharpe:
             best_test_sharpe = test_sharpe
-            torch.save(model.state_dict(), 'best_model.pth')
+            #torch.save(model.state_dict(), 'best_model.pth')
             best_test_predictions = np.concatenate(epoch_test_preds, axis=0)
             best_test_weights = np.concatenate(epoch_test_weights, axis=0)
         
@@ -619,8 +620,8 @@ def train_model_rank(model, train_loader, test_loader, optimizer, scheduler, epo
             max_w = np.max(best_test_weights) if best_test_weights is not None else 0
             print(f"Epoch {epoch+1}/{epochs}, "
                   f"Loss: {avg_loss:.4f}, "
-                  f"Train Sharpe: {train_sharpe:.4f}, "
-                  f"Test Sharpe: {test_sharpe:.4f}, "
+                  f"Train fit: {train_sharpe:.4f}, "
+                  f"Test fit: {test_sharpe:.4f}, "
                   f"Avg Weight: {avg_weight:.4f}, "
                   f"Max Weight: {max_w:.4f}")
 
@@ -782,72 +783,7 @@ def merge_pls_with_asof(daily_returns, pls_data):
     
     return merged_df
 
-def check_merge_quality(merged_df, original_daily_df):
-    """
-    Check the quality of the merge operation.
-    
-    Parameters:
-    -----------
-    merged_df : DataFrame
-        Result from merge operation
-    original_daily_df : DataFrame
-        Original daily returns dataframe
-    """
-    
-    print("\n" + "="*50)
-    print("MERGE QUALITY REPORT")
-    print("="*50)
-    
-    print(f"Original daily rows: {len(original_daily_df):,}")
-    print(f"Merged rows: {len(merged_df):,}")
-    print(f"Rows with PLS data: {merged_df['pls_index'].notna().sum():,}")
-    print(f"Rows missing PLS data: {merged_df['pls_index'].isna().sum():,}")
-    print(f"Coverage: {(merged_df['pls_index'].notna().sum() / len(merged_df)) * 100:.1f}%")
-    
-    # Check for duplicates
-    duplicates = merged_df.duplicated(subset=['date', 'PERMNO']).sum()
-    print(f"Duplicate (date, PERMNO) pairs: {duplicates}")
-    
-    # Sample check - show forward fill working
-    print(f"\nSample forward fill check:")
-    sample_permno = merged_df[merged_df['pls_index'].notna()]['PERMNO'].iloc[0]
-    sample_data = merged_df[merged_df['PERMNO'] == sample_permno].head(10)
-    print(sample_data[['date', 'PERMNO', 'DlyRet', 'pls_index']].to_string())
-    
-    # Check date range coverage
-    print(f"\nDate range:")
-    print(f"Daily data: {merged_df['date'].min()} to {merged_df['date'].max()}")
-    pls_dates = merged_df[merged_df['pls_index'].notna()]['date']
-    if len(pls_dates) > 0:
-        print(f"PLS data: {pls_dates.min()} to {pls_dates.max()}")
 
-
-# Quick test function to verify the logic
-def test_merge_logic():
-    """
-    Test the merge logic with sample data
-    """
-    # Create sample data
-    daily_sample = pd.DataFrame({
-        'date': pd.date_range('2000-01-01', '2000-01-31', freq='D'),
-        'PERMNO': [10001] * 31,
-        'DlyRet': np.random.normal(0, 0.02, 31)
-    })
-    
-    pls_sample = pd.DataFrame({
-        'date': ['2000-01-01', '2000-01-15'],
-        'PERMNO': [10001, 10001],
-        'pls_index': [-1.5, -2.0]
-    })
-    pls_sample['date'] = pd.to_datetime(pls_sample['date'])
-    
-    # Test merge
-    result = merge_pls_with_asof(daily_sample, pls_sample)
-    
-    print("Test Results:")
-    print(result[['date', 'PERMNO', 'DlyRet', 'pls_index']].head(20))
-    
-    return result
 
 # Process each PERMNO individually (more memory efficient)
 def memory_efficient_merge(monthly_df, daily_df):
