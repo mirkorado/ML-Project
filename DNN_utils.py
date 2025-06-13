@@ -849,5 +849,53 @@ def test_merge_logic():
     
     return result
 
-
+# Process each PERMNO individually (more memory efficient)
+def memory_efficient_merge(monthly_df, daily_df):
+    """
+    Process each PERMNO individually to ensure proper sorting.
+    
+    """
+    # Step 1: Pre-process data
+    monthly = monthly_df[['date', 'PERMNO', 'pls_index']].copy()
+    monthly['date'] = pd.to_datetime(monthly['date'])
+    monthly['PERMNO'] = monthly['PERMNO'].astype('int32')
+    
+    # Filter daily data
+    valid_permnos = monthly['PERMNO'].unique()
+    daily_df = daily_df[daily_df['PERMNO'].isin(valid_permnos)].copy()
+    daily_df['date'] = pd.to_datetime(daily_df['date'])
+    daily_df['PERMNO'] = daily_df['PERMNO'].astype('int32')
+    
+    # Step 2: Group by PERMNO and process each group
+    results = []
+    
+    for permno in tqdm(valid_permnos, desc="Processing PERMNOs"):
+        # Get data for this PERMNO
+        daily_stock = daily_df[daily_df['PERMNO'] == permno].sort_values('date')
+        monthly_stock = monthly[monthly['PERMNO'] == permno].sort_values('date')
+        
+        if len(daily_stock) == 0 or len(monthly_stock) == 0:
+            continue
+            
+        # Merge for this stock
+        merged_stock = pd.merge_asof(
+            daily_stock,
+            monthly_stock,
+            on='date',
+            direction='forward'
+        )
+        
+        # Drop rows without index values
+        merged_stock = merged_stock.dropna(subset=['pls_index'])
+        
+        if len(merged_stock) > 0:
+            results.append(merged_stock)
+    
+    # Combine all results
+    if results:
+        result = pd.concat(results, ignore_index=True)
+    else:
+        result = pd.DataFrame()
+    
+    return result
 
