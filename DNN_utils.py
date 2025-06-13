@@ -14,6 +14,14 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
+def progressive_cost(weight_change):
+    if weight_change < 0.01:  # Small trade no impact 
+        return weight_change
+    elif weight_change < 0.05:  # Medium trade small impact 
+        return 1.5 * weight_change
+    else:  # Large trade
+        return 2.0 * weight_change
+
 def read_daily_returns(path, nrows=None, low_quantile=0.005, up_quantile=0.995):
 
     # Read data
