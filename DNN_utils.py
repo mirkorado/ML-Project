@@ -117,8 +117,29 @@ def prepare_data(train_df, test_df, lagged_num=5, rolling_window = False):
 
 # Dataset class
 class FinancialDataset(Dataset):
+    """
+    A custom PyTorch Dataset for financial tabular data.
+
+    Stores numerical and categorical features along with a target column,
+    converting them to appropriate PyTorch-compatible dtypes for memory
+    efficiency and training performance.
+
+    Attributes:
+        X_num (np.ndarray): Numerical features as float32.
+        X_cat (np.ndarray): Categorical features as int32.
+        y (np.ndarray): Target values as float32.
+    """
     # Use float32 for low memory usage and training speedup 
     def __init__(self, df, features, cat_features, target_col='DlyRet'):
+        """
+        Initializes the dataset with numerical, categorical features, and the target column.
+
+        Args:
+            df (pd.DataFrame): Input dataframe containing the features and target.
+            features (List[str]): List of numerical feature column names.
+            cat_features (List[str]): List of categorical feature column names.
+            target_col (str): Name of the target column. Defaults to 'DlyRet'.
+        """
         self.X_num = df[features].values.astype(np.float32)
         self.X_cat = df[cat_features].values.astype(np.int32)
         self.y = df[target_col].values.astype(np.float32)
@@ -130,6 +151,17 @@ class FinancialDataset(Dataset):
         return self.X_num[idx], self.X_cat[idx], self.y[idx]
 
 class ResidualBlock(nn.Module):
+    """
+    A residual block with two fully connected layers, batch normalization,
+    LeakyReLU activations, and dropout.
+
+    This block allows the model to learn identity mappings and improves
+    training stability and depth handling.
+
+    Args:
+        dim (int): Dimension of the input and output features.
+        dropout_prob (float): Probability of dropout. Defaults to 0.3.
+    """
     def __init__(self, dim, dropout_prob=0.3):  # add dropout param
         super().__init__()
         self.fc1 = nn.Linear(dim, dim)
@@ -143,6 +175,15 @@ class ResidualBlock(nn.Module):
         self.dropout2 = nn.Dropout(dropout_prob)  # add dropout
 
     def forward(self, x):
+        """
+        Forward pass of the residual block.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, dim).
+
+        Returns:
+            torch.Tensor: Output tensor with the same shape as input.
+        """
         residual = x
         out = self.fc1(x)
         out = self.bn1(out)
@@ -157,6 +198,21 @@ class ResidualBlock(nn.Module):
         return out
         
 class ResidualMLP(nn.Module):
+    """
+    A multilayer perceptron with embedding layers for categorical inputs and 
+    residual blocks for deep feature extraction.
+
+    This model combines numerical and embedded categorical features and applies
+    multiple residual blocks to learn complex relationships.
+
+    Args:
+        num_numeric_feats (int): Number of numerical input features.
+        cat_dims (List[int]): List containing the number of categories for each categorical feature.
+        embedding_dim (int): Size of embedding vectors for categorical features. Defaults to 8.
+        hidden_dim (int): Dimension of hidden layers. Defaults to 64.
+        n_blocks (int): Number of residual blocks. Defaults to 3.
+        dropout_prob (float): Dropout probability. Defaults to 0.2.
+    """
     def __init__(self, num_numeric_feats, cat_dims, embedding_dim=8, hidden_dim=64, n_blocks=3, dropout_prob=0.2):
         super().__init__()
         self.embeddings = nn.ModuleList([
@@ -176,7 +232,16 @@ class ResidualMLP(nn.Module):
         self.fc_out = nn.Linear(hidden_dim, 1)
 
     def forward(self, x_num, x_cat):
-        
+        """
+        Forward pass through the ResidualMLP model.
+
+        Args:
+            x_num (torch.Tensor): Numerical feature tensor of shape (batch_size, num_numeric_feats).
+            x_cat (torch.Tensor): Categorical feature tensor of shape (batch_size, num_categorical_feats).
+
+        Returns:
+            torch.Tensor: Predicted values of shape (batch_size,).
+        """
         embedded = [emb(x_cat[:, i]) for i, emb in enumerate(self.embeddings)]
         x = torch.cat([x_num] + embedded, dim=1)
 
@@ -199,6 +264,36 @@ def sharpe_ratio_loss(y_pred, y_true, eps=1e-6):
 
 def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rate=0.001, 
               max_weight=0.05, diversification_lambda=0.5, temperature=0.3, loss_function = 'softmax_reg'):
+    """
+    Trains a deep neural network (DNN) using tabular financial data with numerical and categorical features.
+
+    This function sets up data preprocessing, model architecture (ResidualMLP), and training logic 
+    using one of several supported loss functions: softmax regression, negative Sharpe ratio, or linear ranking.
+
+    Args:
+        train_df (pd.DataFrame): Training dataset containing features and target column.
+        test_df (pd.DataFrame): Test dataset containing features and target column.
+        features (List[str]): List of numerical feature column names.
+        cat_features (List[str]): List of categorical feature column names.
+        epochs (int, optional): Number of training epochs. Defaults to 50.
+        learning_rate (float, optional): Learning rate for the AdamW optimizer. Defaults to 0.001.
+        max_weight (float, optional): Maximum position weight used in softmax-based allocation. Defaults to 0.05.
+        diversification_lambda (float, optional): Weight for diversification penalty in softmax loss. Defaults to 0.5.
+        temperature (float, optional): Temperature parameter for softmax allocation. Defaults to 0.3.
+        loss_function (str, optional): Loss function to use. One of {'softmax_reg', 'neg_sharpe', 'lin_rank'}.
+            - 'softmax_reg': Softmax portfolio weighting with diversification regularization.
+            - 'neg_sharpe': Negative Sharpe ratio loss.
+            - 'lin_rank': Linear rank-based loss focused on top-K selection.
+
+    Returns:
+        Tuple:
+            train_losses (List[float]): Training loss values over epochs.
+            test_losses (List[float]): Test loss values over epochs.
+            train_sharpes (List[float]): Training Sharpe ratios over epochs.
+            test_sharpes (List[float]): Test Sharpe ratios over epochs.
+            strat_returns (List[np.ndarray]): List of daily returns from the strategy on the test set.
+            weights (Optional[List[np.ndarray]]): Portfolio weights predicted by the model (only for softmax_reg and lin_rank).
+    """
     
     TRAIN_BATCH_SIZE = 2048
     TEST_BATCH_SIZE = 4096
@@ -262,7 +357,8 @@ def train_model_negative_sharpe(model, train_loader, test_loader, optimizer, sch
     test_losses = []
     train_sharpes = []
     test_sharpes = []
-    
+
+    # Keep track of best predictions
     best_test_sharpe = float('-inf')
     best_test_predictions = None
     
@@ -496,27 +592,27 @@ def sharpe_ratio_loss(y_pred, y_true, max_weight=0.05, diversification_lambda=0.
         y_pred: Raw predictions (before softmax)
         y_true: Actual returns
         max_weight: Maximum allowed weight for any single stock (e.g., 5%)
-        diversification_lambda: Strength of the diversification penalty (0.5 is a good start)
+        diversification_lambda: Strength of the diversification penalty 
         eps: Small value to avoid division by zero
     """
-    # 1. Apply tempered softmax to get weights (lower temperature = more diversified)
+    # Apply tempered softmax to get weights (lower temperature = more diversified)
     temperature = 0.3  # Lower = more uniform weights
     weights = F.softmax(y_pred / temperature, dim=0)
     
-    # 2. Penalize weights exceeding max_weight
+    # Penalize weights exceeding max_weight
     weight_penalty = torch.sum(F.relu(weights - max_weight))
     
-    # 3. Add entropy penalty to encourage diversification (higher entropy = more diversified)
+    # Add entropy penalty to encourage diversification (higher entropy = more diversified)
     entropy = -torch.sum(weights * torch.log(weights + eps))
     entropy_penalty = -entropy  # We want to maximize entropy
     
-    # 4. Compute portfolio returns and Sharpe ratio
+    # Compute portfolio returns and Sharpe ratio
     port_returns = weights * y_true
     mean_return = port_returns.mean()
     std_return = port_returns.std()
     sharpe = mean_return / (std_return + eps)
     
-    # 5. Combine Sharpe with penalties
+    # Combine Sharpe with penalties
     loss = -sharpe + diversification_lambda * (weight_penalty + entropy_penalty)
     
     return loss
@@ -528,7 +624,7 @@ def train_model_rank(model, train_loader, test_loader, optimizer, scheduler, epo
     Training loop with linear rank-based loss.
     Returns test predictions from the epoch with highest Sharpe ratio.
     Args:
-        top_k: Fraction of top stocks to select (e.g., 0.1 = top 10%)
+        top_k: Fraction of top stocks to select (0.1 = top 10%)
     """
     train_losses = []
     test_losses = []
@@ -549,27 +645,26 @@ def train_model_rank(model, train_loader, test_loader, optimizer, scheduler, epo
             
             outputs = model(x_num, x_cat)
             
-            # ------ Linear Rank Loss ------
-            # 1. Get smoothed ranks (differentiable approximation)
+            # Get smoothed ranks (differentiable approximation)
             ranks = smooth_rank(outputs)
             
-            # 2. Select top_k% of stocks
+            # Select top_k% of stocks
             k = int(len(outputs) * top_k)
             top_mask = ranks >= (len(outputs) - k)
             
-            # 3. Assign linear weights based on rank
+            # Assign linear weights based on rank
             weights = torch.zeros_like(outputs)
             if top_mask.sum() > 0:  # Avoid division by zero
                 weights[top_mask] = (ranks[top_mask] - (len(outputs) - k) + 1)
                 weights = weights / weights.sum()
             
-            # 4. Portfolio returns and Sharpe
+            # Portfolio returns and Sharpe
             port_returns = weights * y
             mean_return = port_returns.mean()
             std_return = port_returns.std()
             sharpe = mean_return / (std_return + 1e-6)
             
-            # 5. Loss is negative Sharpe
+            # Loss is negative Sharpe
             loss = -sharpe
             
             loss.backward()
