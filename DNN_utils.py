@@ -13,6 +13,7 @@ import random
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 
 
 def compute_monthly_sharpe(returns):
@@ -50,7 +51,7 @@ def read_daily_returns(path, nrows=None, low_quantile=0.005, up_quantile=0.995):
 
     # Identify outliers for reporting
     outliers = (daily['DlyRet'] < lower_quantile) | (daily['DlyRet'] > upper_quantile)
-    #print(f"Number of daily return outliers: {outliers.sum():,}")
+    print(f"Number of daily return outliers: {outliers.sum():,}")
 
     # Winsorize: cap values at the quantile thresholds
     daily['DlyRet'] = daily['DlyRet'].clip(lower=lower_quantile, upper=upper_quantile)
@@ -62,13 +63,17 @@ def read_daily_returns(path, nrows=None, low_quantile=0.005, up_quantile=0.995):
     # Merge lagged S&P 500 return back into main DataFrame
     daily = daily.merge(sp500_lagged[['date', 'sprtrn_lag1']], on='date', how='left')
 
+    # Encode categorical variables for DNN training
+    # Fit once on ALL data (train + test combined)
+    #le = LabelEncoder()
+    #daily['SICCD'] = le.fit_transform(daily['SICCD'])
+
     return daily
 
 
 def prepare_data(train_df, test_df, lagged_num=5, rolling_window = False):
     '''
-    Prepares the train and test data frames by creating lagged returns and encoding 
-    categorical variables.
+    Prepares the train and test data frames by creating lagged returns 
     '''
 
     # Prepare Data with lagged returns and categorical encoding
@@ -95,14 +100,9 @@ def prepare_data(train_df, test_df, lagged_num=5, rolling_window = False):
                 .transform(lambda x: x.rolling(window=window, min_periods=1).mean().fillna(0.0))
             )
 
-    # Encode categorical columns for embeddings
+    # Encode categorical columns for embeddings (already done with whole initial df)
     categorical_columns = ['SICCD']
-    for col in categorical_columns:
-        train_df[col] = train_df[col].astype('category')
-        train_df[col] = train_df[col].cat.codes
-        test_df[col] = test_df[col].astype('category')
-        test_df[col] = test_df[col].cat.codes
-    
+        
     # Feature lists
     remove_columns = ['PERMCO', 'year_month', 'NAICS', 'date', 'SICCD', 'PERMNO', 'DlyRet', 'sprtrn']  # Unused for training
     features = train_df.columns.tolist()
@@ -176,6 +176,7 @@ class ResidualMLP(nn.Module):
         self.fc_out = nn.Linear(hidden_dim, 1)
 
     def forward(self, x_num, x_cat):
+        
         embedded = [emb(x_cat[:, i]) for i, emb in enumerate(self.embeddings)]
         x = torch.cat([x_num] + embedded, dim=1)
 
@@ -202,6 +203,12 @@ def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rat
     TRAIN_BATCH_SIZE = 2048
     TEST_BATCH_SIZE = 4096
 
+    for col in cat_features:
+        le = LabelEncoder()
+        le.fit(pd.concat([train_df[col], test_df[col]]))
+        train_df[col] = le.transform(train_df[col])
+        test_df[col] = le.transform(test_df[col])
+    
     # Simple data loaders without excessive configuration
     train_dataset = FinancialDataset(train_df, features, cat_features)
     test_dataset = FinancialDataset(test_df, features, cat_features)
@@ -211,7 +218,11 @@ def train_DNN(train_df, test_df, features, cat_features, epochs=50, learning_rat
 
     # Model setup
     num_numeric_feats = len(features)
-    cat_dims = [train_df[col].nunique() for col in cat_features]
+    # Compute correct embedding dimensions across train + test
+    cat_dims = [
+        pd.concat([train_df[col], test_df[col]]).nunique() + 1
+        for col in cat_features
+    ]
 
     model = ResidualMLP(num_numeric_feats, cat_dims)
     
