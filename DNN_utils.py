@@ -35,10 +35,10 @@ def progressive_cost(weight_change, base_tc=0.003, alpha=10):
     return base_tc * (weight_change + alpha * weight_change**2)
 
 
-def read_daily_returns(path, nrows=None, low_quantile=0.005, up_quantile=0.995):
+def read_daily_returns(path, nrows=None, skiprows = None, header=None, low_quantile=0.005, up_quantile=0.995):
 
     # Read data
-    daily = pd.read_csv(path, nrows=nrows)
+    daily = pd.read_csv(path, nrows=nrows, skiprows=skiprows, header=header)
     
     # Ensure datetime format for dates and align with predictors data set start date
     daily['date'] = pd.to_datetime(daily['date'], format = "%Y-%m-%d") 
