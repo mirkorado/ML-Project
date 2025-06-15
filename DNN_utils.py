@@ -660,12 +660,14 @@ def train_model_rank(model, train_loader, test_loader, optimizer, scheduler, epo
             
             # Portfolio returns and Sharpe
             port_returns = weights * y
-            mean_return = port_returns.mean()
-            std_return = port_returns.std()
-            sharpe = mean_return / (std_return + 1e-6)
-            
-            # Loss is negative Sharpe
-            loss = -sharpe
+            if weights.sum() > 0:
+                mean_return = port_returns.mean()
+                std_return = port_returns.std()
+                sharpe = mean_return / (std_return + 1e-6)
+                loss = -sharpe
+            else:
+                # Force a dummy tensor with requires_grad=True to keep graph alive
+                loss = torch.tensor(0.0, requires_grad=True, device=outputs.device)
             
             loss.backward()
             optimizer.step()
